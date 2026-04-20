@@ -1,0 +1,70 @@
+WeMuse · 微信聊天助手
+Non-Commercial Use License
+
+Copyright (c) 2026 Zibin Meng
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software under the terms set forth below.
+
+================================================================================
+PERMITTED USE
+================================================================================
+
+You are granted a free, non-exclusive, non-transferable license to use, copy,
+modify, and redistribute this Software, in whole or in part, subject to the
+following restrictions:
+
+  1. **Personal, educational, and research use only.**  You may use the
+     Software for personal productivity, academic study, scientific research,
+     or evaluation purposes.
+
+  2. **No commercial use.**  You may NOT use the Software, in whole or in part,
+     for any commercial purpose, including but not limited to:
+       - Selling or sublicensing the Software, or derivative works thereof.
+       - Offering the Software as a paid service (SaaS, consulting, etc.).
+       - Integrating the Software into a commercial product or service.
+       - Using the Software to directly generate revenue.
+     Commercial licensing may be arranged by contacting the copyright holder.
+
+  3. **Attribution.**  Copies and substantial portions of the Software must
+     retain this license notice and the copyright line above.
+
+  4. **No impersonation, spam, or harassment.**  You may NOT use the Software
+     to send messages on behalf of others without consent, to conduct bulk
+     marketing / automated outreach, to impersonate individuals, or for any
+     activity that violates Tencent's Terms of Service for WeChat or any
+     applicable law.
+
+================================================================================
+DISCLAIMER
+================================================================================
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+The Software interacts with the macOS client of WeChat (Tencent Holdings Ltd.)
+through Apple's public Accessibility APIs. The Software does not modify or
+inject code into WeChat. Users are solely responsible for ensuring their use
+complies with Tencent's Terms of Service. The authors accept no liability for
+account suspension, data loss, or any other consequence arising from use of
+the Software.
+
+================================================================================
+中文摘要（非正式）
+================================================================================
+
+本软件（WeMuse · 微信聊天助手）以非商业使用许可发布：
+
+  - 允许：个人、学习、科研、非营利用途下自由使用、修改、再分发
+  - 禁止：用于销售、付费服务、商业产品集成等任何营利场景（如需商业授权请
+          联系版权持有者）
+  - 禁止：批量骚扰、自动营销、身份冒充、违反微信服务条款的任何行为
+
+软件按"现状"提供，作者对使用过程中可能出现的账号问题、数据丢失等一切
+后果不承担责任。
