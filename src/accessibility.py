@@ -1,12 +1,11 @@
-"""macOS Accessibility 读取微信聊天内容。
+"""Windows UI Automation 读取微信聊天内容（PC 版微信 3.x/4.x）。
 
-核心思路（v5）：
-  1. 定位到 WeChat 当前窗口（不是整个 app）
-  2. 优先在最大的 AXScrollArea 子树里抓；否则整窗口 + 百分比过滤兜底
-  3. 几何过滤：仅在 whole-window 模式启用；scroll-area 模式下子树本身即聊天区
-  4. 噪音词 / 时间日期 / 表情贴纸 / 过短文字统一过滤
-  5. 发言人靠文本前缀 `"我说:"` / `"XXX说:"` 解析（比 x 坐标精确 100%）
-  6. `read_wechat_multi_pass(passes)` —— 向上翻页触发微信懒加载历史，合并去重
+核心思路（与 macOS 版对应）：
+  1. 用 uiautomation 定位微信主窗口（ClassName='WeChatMainWndForPC'）
+  2. 按几何位置筛选聊天区（去除左侧侧边栏、顶部工具栏、底部输入框）
+  3. 遍历 UIA 控件树，提取所有文本节点
+  4. 优先按 "XXX说:" 前缀解析发言人；兜底用 x 坐标
+  5. read_wechat_multi_pass：向上翻页触发懒加载，合并去重
 """
 from __future__ import annotations
 
@@ -15,59 +14,82 @@ import time
 from collections import Counter
 
 try:
-    from ApplicationServices import (
-        AXIsProcessTrusted,
-        AXUIElementCopyAttributeValue,
-        AXUIElementCreateApplication,
-        AXUIElementSetAttributeValue,
-        AXValueGetValue,
-        kAXValueCGPointType,
-        kAXValueCGSizeType,
-    )
-    from AppKit import NSWorkspace
-
+    import uiautomation as uia
     _AVAILABLE = True
     _IMPORT_ERR = ""
 except Exception as e:  # noqa: BLE001
     _AVAILABLE = False
     _IMPORT_ERR = str(e)
+    uia = None  # type: ignore[assignment]
 
-WECHAT_BUNDLE = "com.tencent.xinWeChat"
+try:
+    import win32gui
+    import win32con
+    import win32process
+    _WIN32 = True
+except Exception:  # noqa: BLE001
+    _WIN32 = False
 
-# 几何比例（根据 macOS WeChat 典型布局调）
-# 注意：窄高窗口（外接竖屏）下侧边栏比例更大，所以 SIDEBAR_FRAC 宁可偏大
-SIDEBAR_FRAC = 0.32   # 左侧约 32% 是联系人列表
-TOOLBAR_FRAC = 0.05   # 顶部 5% 是标题栏
-INPUT_FRAC = 0.18     # 底部 18% 是输入框 + 表情/图片按钮区
-CHAT_LEFT_FRAC = SIDEBAR_FRAC  # 聊天区域左边界
-CHAT_RIGHT_FRAC = 1.0          # 聊天区域右边界
+try:
+    import mss
+    _MSS = True
+except Exception:  # noqa: BLE001
+    _MSS = False
 
-# 硬过滤：已知的 UI 噪音字符串（按钮、占位、导航项、容器标题）
+WECHAT_CLASS = "WeChatMainWndForPC"
+WECHAT_NAMES = {"微信", "WeChat"}
+
+# 几何比例（Windows 微信典型布局：左侧功能栏+联系人列表约占 30%）
+CONTACT_FRAC = 0.28   # 左侧 28%（功能图标栏 + 联系人列表）
+TOOLBAR_FRAC = 0.09   # 顶部 9%（标题栏 + 聊天对象名称）
+INPUT_FRAC   = 0.18   # 底部 18%（输入框 + 工具条，含表情/发送文件/截图按钮行）
+
 _UI_NOISE: set[str] = {
-    "折叠置顶聊天", "置顶聊天", "展开置顶聊天",
-    "搜索", "Search", "搜索聊天",
-    "通讯录", "发现", "我", "设置",
-    "微信", "WeChat",
-    "Field", "TextField",
-    "发送", "Send",
-    "新的朋友", "公众号", "订阅号", "收藏", "聊天",
-    "星标朋友", "群聊",
-    "表情", "图片", "文件", "位置", "视频", "语音",
-    "消息",  # AXTable 的标题
+    "搜索", "Search",
+    "通讯录", "发现", "设置",
+    "收藏", "聊天", "朋友圈", "扫一扫",
+    "发送", "Send", "发送(S)",
+    "群助手", "新的朋友", "公众号",
+    # 顶栏按钮
+    "更多", "最小化", "最大化", "还原", "关闭",
+    # 输入区按钮
+    "表情", "聊天记录", "语音聊天", "视频聊天",
 }
 
-# 正则：时间/日期分隔条（居中显示，和气泡分类冲突，直接丢）
-_TIME_RE = re.compile(r"^\s*\d{1,2}[:：]\d{2}\s*$")
-_DATE_WORDS = ("昨天", "今天", "前天", "明天", "星期", "周一", "周二", "周三", "周四", "周五", "周六", "周日")
+_STICKER_RE = re.compile(
+    r"发送了一(?:个表情|张图片|张动画表情|段视频|段语音|条语音)|撤回了一条消息"
+)
+# UI 按钮/快捷键标记（"表情(Alt+E)"、"截图(Alt + A)"、"发送(S)"等）
+_UI_BTN_RE = re.compile(r"\(Alt\s*\+\s*[A-Z]\)|\([A-Z]\)$")
+# 微信系统分隔符
+_SYS_MARK_RE = re.compile(r"^以下(?:为|是)新消息$|^\s*—+\s*$")
+# 时间戳：HH:MM 或 HH:MM:SS；支持中文冒号；允许前后有空白
+_TIME_RE = re.compile(r"^\s*\d{1,2}[:：]\d{2}(?:[:：]\d{2})?\s*$")
+# 日期+时间组合：e.g. "昨天 15:30"、"上午 10:05"、"2024/3/5 20:00"、"3月5日 15:30"
+_DATE_TIME_RE = re.compile(
+    r"^\s*(?:"
+    r"\d{4}[年/\-]\d{1,2}[月/\-]\d{1,2}日?"                    # 2024年3月5日 / 2024/3/5
+    r"|\d{1,2}[月/\-]\d{1,2}日?"                               # 3月5日 / 3/5
+    r"|昨天|今天|前天|星期[一二三四五六日天]|周[一二三四五六日天]"
+    r"|上午|下午|凌晨|早上|中午|晚上|傍晚"
+    r")"
+    r"(?:\s*\d{1,2}[:：]\d{2}(?:[:：]\d{2})?)?\s*$"
+)
+_DATE_WORDS = ("昨天", "今天", "前天", "星期", "周一", "周二", "周三",
+               "周四", "周五", "周六", "周日", "上午", "下午",
+               "凌晨", "早上", "中午", "晚上", "傍晚")
 
-# 微信 Accessibility 把发言人写在文本里：
-#   "我说:..." / "我:..." (后者多见于表情/图片等系统消息)
-#   "葛诗霖说:..." / "葛诗霖:..."
-# 这是比 x 坐标更可靠的发言人信号
-_SPEAKER_RE = re.compile(r"^(.{1,10}?)(?:说)?\s*[:：]\s*")
+# 明确跳过的控件类型（按钮、工具栏等非消息控件）
+_SKIP_CTRL_TYPES: set[str] = {
+    "ButtonControl", "ToolBarControl", "MenuBarControl", "MenuItemControl",
+    "TitleBarControl", "HeaderControl", "ScrollBarControl", "SliderControl",
+    "SplitButtonControl", "TabItemControl", "TreeItemControl",
+}
 
-# 系统型消息（表情/图片/撤回）——不带信息量，直接过滤，避免污染回复生成
-_STICKER_RE = re.compile(r"发送了一(?:个表情|张图片|张动画表情|段视频|段语音|条语音)|撤回了一条消息")
+# 严格的发言人前缀：必须含"说"，或冒号前是人名样的短串（禁止纯数字/URL）
+# 例： "张三说：" / "张三:" / "我说:"  —— 不匹配 "15:30" / "http://..." / "8:00"
+_SPEAKER_SAY_RE = re.compile(r"^(.{1,15}?)说\s*[:：]\s*")
+_SPEAKER_COLON_RE = re.compile(r"^([^\d\s:：/\\.()（）<>《》\"'`]{1,15})\s*[:：]\s*")
 
 
 def available() -> bool:
@@ -78,484 +100,627 @@ def import_error() -> str:
     return _IMPORT_ERR
 
 
-def trusted() -> bool:
-    if not _AVAILABLE:
-        return False
-    try:
-        return bool(AXIsProcessTrusted())
-    except Exception:  # noqa: BLE001
-        return False
+# ---------- 定位微信窗口 ----------
 
+def _find_wechat_hwnd() -> int | None:
+    """通过 win32gui 枚举窗口找到微信主窗口句柄。
 
-def wechat_pid() -> int | None:
-    if not _AVAILABLE:
+    只认 ClassName=WeChatMainWndForPC 且尺寸够大的窗口——标题为"微信"的
+    桌面弹窗通知会干扰，必须排除。
+    """
+    if not _WIN32:
         return None
-    for app in NSWorkspace.sharedWorkspace().runningApplications():
+    candidates: list[tuple[int, int]] = []  # (hwnd, area)
+
+    def _cb(hwnd, _):
         try:
-            bid = app.bundleIdentifier()
-            name = app.localizedName() or ""
+            if not win32gui.IsWindowVisible(hwnd) or win32gui.IsIconic(hwnd):
+                return
+            cls = win32gui.GetClassName(hwnd)
+            if cls != WECHAT_CLASS:
+                return
+            rect = win32gui.GetWindowRect(hwnd)
+            w = rect[2] - rect[0]
+            h = rect[3] - rect[1]
+            # 主窗口至少 600x400；通知弹窗只有 ~220x100
+            if w >= 600 and h >= 400:
+                candidates.append((hwnd, w * h))
         except Exception:  # noqa: BLE001
-            continue
-        if bid == WECHAT_BUNDLE or name in ("WeChat", "微信"):
-            return int(app.processIdentifier())
-    return None
+            pass
 
-
-# ---------- AX helpers ----------
-
-def _attr(elem, name: str):
     try:
-        err, val = AXUIElementCopyAttributeValue(elem, name, None)
-        if err != 0:
-            return None
-        return val
-    except Exception:  # noqa: BLE001
-        return None
-
-
-_POINT_RE = re.compile(r"x\s*:\s*([-\d.]+)\s+y\s*:\s*([-\d.]+)")
-_SIZE_RE = re.compile(r"w(?:idth)?\s*:\s*([-\d.]+)\s+h(?:eight)?\s*:\s*([-\d.]+)")
-
-
-def _parse_point(v) -> tuple[float, float] | None:
-    if v is None:
-        return None
-    try:
-        ok, point = AXValueGetValue(v, kAXValueCGPointType, None)
-        if ok:
-            return float(point.x), float(point.y)
+        win32gui.EnumWindows(_cb, None)
     except Exception:  # noqa: BLE001
         pass
+    if not candidates:
+        return None
+    candidates.sort(key=lambda t: -t[1])  # 面积最大的优先
+    return candidates[0][0]
+
+
+def _get_wechat_control():
+    """获取微信 UIA 根控件。优先按 hwnd 精确获取，否则按 ClassName 搜索。"""
+    hwnd = _find_wechat_hwnd()
+    if hwnd and _WIN32:
+        try:
+            ctrl = uia.ControlFromHandle(hwnd)
+            if ctrl and ctrl.Exists(0):
+                return ctrl
+        except Exception:  # noqa: BLE001
+            pass
+    # 回退：全局搜索（深度 2 以提速）
     try:
-        m = _POINT_RE.search(str(v))
-        if m:
-            return float(m.group(1)), float(m.group(2))
+        ctrl = uia.WindowControl(ClassName=WECHAT_CLASS, searchDepth=2)
+        if ctrl.Exists(1):
+            return ctrl
     except Exception:  # noqa: BLE001
         pass
     return None
 
 
-def _parse_size(v) -> tuple[float, float] | None:
-    if v is None:
-        return None
-    try:
-        ok, size = AXValueGetValue(v, kAXValueCGSizeType, None)
-        if ok:
-            return float(size.width), float(size.height)
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        m = _SIZE_RE.search(str(v))
-        if m:
-            return float(m.group(1)), float(m.group(2))
-    except Exception:  # noqa: BLE001
-        pass
-    return None
+# ---------- 控件树遍历 ----------
 
+def _walk_controls(
+    ctrl,
+    out: list[dict],
+    bounds_filter: tuple[float, float, float, float] | None = None,
+    depth: int = 0,
+    max_depth: int = 18,
+    cap: int = 800,
+) -> None:
+    """递归遍历 UIA 控件树，收集文本节点。
 
-def _walk(elem, out: list[dict], depth: int = 0, max_depth: int = 30, cap: int = 3000) -> None:
+    bounds_filter: (x, y, w, h)——只收录中心点在此矩形内的控件。
+    """
     if len(out) >= cap or depth > max_depth:
         return
 
-    role = _attr(elem, "AXRole") or ""
-    text: str | None = None
-    for attr_name in ("AXValue", "AXDescription", "AXTitle"):
-        v = _attr(elem, attr_name)
-        if isinstance(v, str) and v.strip():
-            text = v.strip()
-            break
+    try:
+        name: str = (ctrl.Name or "").strip()
+        role: str = ctrl.ControlTypeName or ""
+        rect = ctrl.BoundingRectangle
+        x, y = rect.left, rect.top
+        w, h = rect.right - x, rect.bottom - y
 
-    if text:
-        pos = _parse_point(_attr(elem, "AXPosition"))
-        size = _parse_size(_attr(elem, "AXSize"))
-        out.append(
-            {
-                "text": text,
-                "role": role,
-                "x": pos[0] if pos else None,
-                "y": pos[1] if pos else None,
-                "w": size[0] if size else None,
-                "h": size[1] if size else None,
-            }
+        # 综合过滤
+        keep = (
+            name
+            and name not in _UI_NOISE
+            and role not in _SKIP_CTRL_TYPES
+            and not _STICKER_RE.search(name)
+            and not _UI_BTN_RE.search(name)
+            and not _SYS_MARK_RE.match(name)
         )
+        if keep:
+            in_area = True
+            if bounds_filter is not None:
+                bx, by, bw, bh = bounds_filter
+                cx = x + w / 2
+                # 水平：用中心点（避免把侧栏联系人拉进来）
+                # 垂直：用 TOP——只要控件顶边在聊天区内就收录，允许底边
+                # 探进输入区。否则最新消息（靠近输入框）会因中心点越界被漏。
+                in_area = (bx <= cx <= bx + bw) and (by <= y <= by + bh)
+            if in_area:
+                out.append({
+                    "text": name, "role": role,
+                    "x": x, "y": y, "w": w, "h": h,
+                })
+    except Exception:  # noqa: BLE001
+        pass
 
-    children = _attr(elem, "AXChildren")
-    if children:
-        for child in children:
-            _walk(child, out, depth + 1, max_depth, cap)
+    # 遍历子控件
+    try:
+        child = ctrl.GetFirstChildControl()
+        while child:
+            _walk_controls(child, out, bounds_filter, depth + 1, max_depth, cap)
+            try:
+                child = child.GetNextSiblingControl()
+            except Exception:  # noqa: BLE001
+                break
+    except Exception:  # noqa: BLE001
+        pass
 
 
-# ---------- filter ----------
+# ---------- 过滤 ----------
 
 def _is_timestamp(text: str) -> bool:
     t = text.strip()
-    if len(t) > 12:
+    if len(t) > 25:
         return False
     if _TIME_RE.match(t):
         return True
-    if any(w in t for w in _DATE_WORDS):
+    if _DATE_TIME_RE.match(t):
+        return True
+    # 兜底：短文本且含日期词（如 "星期一"、"昨天"）
+    if len(t) <= 12 and any(w in t for w in _DATE_WORDS):
         return True
     return False
 
 
 def _parse_speaker(text: str) -> tuple[str | None, str]:
-    """把 '我说:xxx' / '葛诗霖说:yyy' 拆成 (发言人名, 正文)。匹配不到返回 (None, 原文)。"""
-    m = _SPEAKER_RE.match(text)
-    if not m:
-        return None, text
-    name = m.group(1).strip()
-    if not name or name == "":
-        return None, text
-    return name, text[m.end():].strip()
+    # 优先匹配带"说"的格式（最可靠）
+    m = _SPEAKER_SAY_RE.match(text)
+    if m:
+        name = m.group(1).strip()
+        if name:
+            return name, text[m.end():].strip()
+    # 其次匹配冒号前是干净短串（无数字/斜杠/点号，排除 "15:30"、"http://..."）
+    m = _SPEAKER_COLON_RE.match(text)
+    if m:
+        name = m.group(1).strip()
+        # 排除明显不是人名的前缀
+        if name and name not in ("http", "https", "ftp", "www"):
+            return name, text[m.end():].strip()
+    return None, text
 
 
-def _is_chat_message(
-    item: dict, wx: float, wy: float, ww: float, wh: float
-) -> bool:
-    text = item["text"]
-    x, y = item.get("x"), item.get("y")
+# ---------- 气泡颜色判定 ----------
 
-    # 1. 几何：必须在聊天区域（不在侧边栏、不在顶栏、不在输入框）
-    if x is None or y is None:
-        return False
-    if x < wx + ww * SIDEBAR_FRAC:
-        return False
-    if y < wy + wh * TOOLBAR_FRAC:
-        return False
-    if y > wy + wh * (1 - INPUT_FRAC):
-        return False
-    # 2. 噪音词
-    if text in _UI_NOISE:
-        return False
-    # 3. 时间分隔条
-    if _is_timestamp(text):
-        return False
-    # 4. 太短（< 2 字）的文字多半是按钮 / 标识符
-    if len(text.strip()) < 2:
-        return False
-    return True
-
-
-# ---------- public ----------
-
-def _window_and_items(win) -> tuple[tuple[float, float, float, float] | None, list[dict]]:
-    pos = _parse_point(_attr(win, "AXPosition"))
-    size = _parse_size(_attr(win, "AXSize"))
-    bounds = None
-    if pos and size:
-        bounds = (pos[0], pos[1], size[0], size[1])
-    items: list[dict] = []
-    _walk(win, items)
-    return bounds, items
-
-
-def _find_scroll_areas(elem, out: list, depth: int = 0, max_depth: int = 20) -> None:
-    """深度遍历找所有 AXScrollArea 及其几何。"""
-    if depth > max_depth:
-        return
-    role = _attr(elem, "AXRole") or ""
-    if role == "AXScrollArea":
-        pos = _parse_point(_attr(elem, "AXPosition"))
-        size = _parse_size(_attr(elem, "AXSize"))
-        if pos and size:
-            out.append(
-                {
-                    "elem": elem,
-                    "x": pos[0],
-                    "y": pos[1],
-                    "w": size[0],
-                    "h": size[1],
-                }
-            )
-    children = _attr(elem, "AXChildren") or []
-    for child in children:
-        _find_scroll_areas(child, out, depth + 1, max_depth)
-
-
-def _pick_chat_scroll_area(
-    scrolls: list[dict], window: tuple[float, float, float, float]
-) -> dict | None:
-    """从窗口内所有 AXScrollArea 里挑出"最可能是聊天区"的那个。
-
-    规则：
-      1. 必须在窗口右半边（排除左侧联系人列表）
-      2. 再按面积（w*h）取最大
+def _grab_wechat_pixels(rect: tuple[int, int, int, int]):
+    """截取微信窗口像素数据。返回 (pixels, origin_x, origin_y, width)——
+    pixels 是扁平 BGRA bytes，索引 (y*W + x)*4 拿到 B,G,R,A。
     """
-    if not scrolls:
+    if not _MSS:
         return None
-    wx, _, ww, _ = window
-    # 过滤条件：中心点落在窗口右 60% 区域
-    mid_x = wx + ww * 0.4
-    right_side = [s for s in scrolls if s["x"] + s["w"] / 2 >= mid_x]
-    candidates = right_side or scrolls
-    candidates.sort(key=lambda s: s["w"] * s["h"], reverse=True)
-    return candidates[0]
+    left, top, right, bottom = rect
+    w, h = right - left, bottom - top
+    try:
+        with mss.mss() as sct:
+            raw = sct.grab({"left": left, "top": top, "width": w, "height": h})
+            return (bytes(raw.bgra), left, top, w, h)
+    except Exception as e:  # noqa: BLE001
+        print(f"[UIA] 截屏失败: {e}", flush=True)
+        return None
 
+
+def _vote_bubble_speaker(pixels_info, item: dict) -> tuple[str | None, int, int, int]:
+    """在文字 bbox 的**外侧**采样气泡背景色，返回 ('我'/'对方'/None, greens, whites, skipped)。
+
+    为什么采样点要落在 bbox 外侧：UIA 的 TextControl 返回的 BoundingRectangle 是
+    紧贴文字的排版框，"四角内移 3 像素"这种采法对中文短字会直接打在笔画上
+    （r+g+b 很小），无论绿白气泡都会被当成非绿，导致所有"我"都被判成"对方"。
+    正确做法是在文字 bbox 的左右两侧紧邻 4/8/12 像素处采样——微信气泡对文字
+    有 8~12 像素的内边距，这些采样点几乎必然在气泡背景色上。
+    """
+    if pixels_info is None:
+        return None, 0, 0, 0
+    pixels, ox, oy, pw, ph = pixels_info
+    x, y, w, h = item["x"], item["y"], item["w"], item["h"]
+    lx, ly = x - ox, y - oy
+
+    y_mid = ly + h // 2
+    y_top = ly + max(2, h // 4)
+    y_bot = ly + h - max(2, h // 4)
+
+    pts: list[tuple[int, int]] = []
+    for dx in (4, 8, 12):
+        pts.append((lx - dx, y_mid))
+        pts.append((lx - dx, y_top))
+        pts.append((lx - dx, y_bot))
+        pts.append((lx + w + dx, y_mid))
+        pts.append((lx + w + dx, y_top))
+        pts.append((lx + w + dx, y_bot))
+
+    greens = whites = skipped = 0
+    for sx, sy in pts:
+        if not (0 <= sx < pw and 0 <= sy < ph):
+            skipped += 1
+            continue
+        idx = (sy * pw + sx) * 4
+        if idx + 3 > len(pixels):
+            skipped += 1
+            continue
+        b, g, r = pixels[idx], pixels[idx + 1], pixels[idx + 2]
+        if r + g + b < 200:  # 文字笔画 / 头像深色区
+            skipped += 1
+            continue
+        # 绿气泡 #95EC69 ≈ (149,236,105)
+        if g > 170 and g > r + 15 and g > b + 40:
+            greens += 1
+        # 白气泡 / 浅灰
+        elif r > 220 and g > 220 and b > 220:
+            whites += 1
+        else:
+            skipped += 1
+
+    if greens > whites and greens >= 2:
+        return "我", greens, whites, skipped
+    if whites > greens and whites >= 2:
+        return "对方", greens, whites, skipped
+    return None, greens, whites, skipped
+
+
+# ---------- 公开接口 ----------
 
 def read_wechat_as_text(debug: bool = True) -> tuple[str, int] | None:
-    """读取当前 WeChat 聊天窗口，返回（我/对方 标注文本，消息条数）。
-
-    策略（v3）：
-      1. 先找聊天区的 AXScrollArea 子树，只在它里面抓文本（最稳）
-      2. 找不到 scroll area 就退回到全窗口遍历 + 百分比过滤
-    失败返回 None；debug 始终在 stdout 打印诊断，方便定位。
-    """
-    # 永远打印开头行：便于定位到底走到哪一步
-    print(f"[AX] trusted={trusted()}  wechat_pid={wechat_pid()}", flush=True)
-
-    if not trusted():
-        print("[AX] ✗ 未授权辅助功能。去「系统设置 → 隐私与安全性 → 辅助功能」给当前启动者打勾。", flush=True)
+    """读取当前微信聊天窗口，返回 (带我/对方标注的文本, 消息条数)。失败返回 None。"""
+    if not _AVAILABLE:
+        print(f"[UIA] uiautomation 不可用: {_IMPORT_ERR}", flush=True)
         return None
 
-    pid = wechat_pid()
-    if pid is None:
-        print("[AX] ✗ 没找到微信进程（未启动 / 未登录？）", flush=True)
-        return None
-    app_elem = AXUIElementCreateApplication(pid)
-    if app_elem is None:
-        print("[AX] ✗ AXUIElementCreateApplication 返回 None", flush=True)
+    print("[UIA] 开始读取微信…", flush=True)
+
+    win_ctrl = _get_wechat_control()
+    if win_ctrl is None:
+        print("[UIA] 未找到微信窗口（未启动 / 未登录 / 已最小化？）", flush=True)
         return None
 
-    win = _attr(app_elem, "AXFocusedWindow")
-    source = "AXFocusedWindow"
-    if win is None:
-        wins = _attr(app_elem, "AXWindows")
-        print(f"[AX] AXFocusedWindow=None, AXWindows count={len(wins) if wins else 0}", flush=True)
-        if wins:
-            win = wins[0]
-            source = "AXWindows[0]"
-    if win is None:
-        print("[AX] ✗ 连一个窗口都拿不到（微信可能整个最小化了 / 只显示在 Dock）", flush=True)
+    try:
+        rect = win_ctrl.BoundingRectangle
+        wx, wy = rect.left, rect.top
+        ww, wh = rect.right - wx, rect.bottom - wy
+    except Exception as e:  # noqa: BLE001
+        print(f"[UIA] 获取窗口几何失败: {e}", flush=True)
         return None
-    print(f"[AX] window source = {source}", flush=True)
 
-    win_pos = _parse_point(_attr(win, "AXPosition"))
-    win_size = _parse_size(_attr(win, "AXSize"))
-    if not win_pos or not win_size:
-        print(f"[AX] ✗ 拿不到窗口几何  pos={win_pos} size={win_size}", flush=True)
-        return None
-    window_bounds = (win_pos[0], win_pos[1], win_size[0], win_size[1])
-    wx, wy, ww, wh = window_bounds
-
-    # --- 尝试走 scroll-area 子树 ---
-    scrolls: list[dict] = []
-    _find_scroll_areas(win, scrolls)
-    chat_scroll = _pick_chat_scroll_area(scrolls, window_bounds)
-
-    mode_used = ""
-    if chat_scroll is not None:
-        mode_used = "scroll-area"
-        root_elem = chat_scroll["elem"]
-        area_x, area_y = chat_scroll["x"], chat_scroll["y"]
-        area_w, area_h = chat_scroll["w"], chat_scroll["h"]
-    else:
-        mode_used = "whole-window"
-        root_elem = win
-        # fallback 按原来的比例切
-        area_x = wx + ww * SIDEBAR_FRAC
-        area_y = wy + wh * TOOLBAR_FRAC
-        area_w = ww * (1 - SIDEBAR_FRAC)
-        area_h = wh * (1 - TOOLBAR_FRAC - INPUT_FRAC)
+    # 聊天区范围
+    chat_x = wx + ww * CONTACT_FRAC
+    chat_y = wy + wh * TOOLBAR_FRAC
+    chat_w = ww * (1.0 - CONTACT_FRAC)
+    chat_h = wh * (1.0 - TOOLBAR_FRAC - INPUT_FRAC)
 
     raw_items: list[dict] = []
-    _walk(root_elem, raw_items)
+    _walk_controls(win_ctrl, raw_items, bounds_filter=(chat_x, chat_y, chat_w, chat_h))
 
-    # scroll-area 模式下：子树本身就是聊天区，y 坐标可能远超窗口（滚动内容虚拟高度），不做 y 过滤
-    # whole-window 模式下：做完整的 x/y 几何过滤兜底
-    use_strict_geometry = mode_used == "whole-window"
-
-    def _accept(it: dict) -> bool:
-        text = it["text"]
-        if text in _UI_NOISE:
-            return False
-        # 注意：**不再丢掉时间戳**——时间是重要的上下文，改在输出时格式化为分隔符
-        if _STICKER_RE.search(text):
-            return False
-        if len(text.strip()) < 2:
-            return False
-        if use_strict_geometry:
-            x, y = it.get("x"), it.get("y")
-            if x is None or y is None:
-                return False
-            if not (area_x - 2 <= x <= area_x + area_w + 2):
-                return False
-            if not (area_y - 2 <= y <= area_y + area_h + 2):
-                return False
-        return True
-
-    filtered = [it for it in raw_items if _accept(it)]
-
-    role_counts = Counter((it.get("role") or "?") for it in raw_items)
-    print(
-        f"[AX] roles in subtree: {dict(role_counts.most_common(8))}  "
-        f"geometry_filter={'on' if use_strict_geometry else 'off'}",
-        flush=True,
-    )
-
-    print(
-        f"[AX] mode={mode_used}  window=x:{wx:.0f} y:{wy:.0f} w:{ww:.0f} h:{wh:.0f}",
-        flush=True,
-    )
-    print(
-        f"[AX] chat_area=x:{area_x:.0f} y:{area_y:.0f} w:{area_w:.0f} h:{area_h:.0f}",
-        flush=True,
-    )
-    print(
-        f"[AX] scrolls_found={len(scrolls)}  raw={len(raw_items)}  filtered={len(filtered)}",
-        flush=True,
-    )
-    # 打印前 20 条原始文本（包括过滤掉的），帮助你看气泡到底在哪个 role 里
-    for it in raw_items[:20]:
+    if debug:
         print(
-            f"  raw  role={it['role']:<18} x={it['x']} y={it['y']} text={it['text'][:40]!r}",
+            f"[UIA] 窗口=({wx},{wy},{ww},{wh})  "
+            f"聊天区=({chat_x:.0f},{chat_y:.0f},{chat_w:.0f},{chat_h:.0f})",
             flush=True,
         )
-    for it in filtered[:20]:
+        role_cnt = Counter(it["role"] for it in raw_items)
+        print(f"[UIA] 角色分布: {dict(role_cnt.most_common(6))}  总条目={len(raw_items)}", flush=True)
+        for it in raw_items[:15]:
+            print(
+                f"  raw role={it['role']:<20} x={it['x']} y={it['y']}"
+                f" text={it['text'][:50]!r}",
+                flush=True,
+            )
+
+    if not raw_items:
         print(
-            f"  kept role={it['role']:<18} x={it['x']} y={it['y']} text={it['text'][:40]!r}",
+            "[UIA] 0 条通过过滤。可能原因：\n"
+            "  • 微信不在聊天界面（在通讯录/发现）\n"
+            "  • 窗口被遮挡或最小化\n"
+            "  • 几何参数需要调整（调整 CONTACT_FRAC / TOOLBAR_FRAC / INPUT_FRAC）",
             flush=True,
         )
-
-    if not filtered:
-        print("[AX] ✗ 0 条通过过滤。上面 raw 样本里如果能看到你微信里的消息文本，说明是几何/噪音词过滤把它们误杀——告诉我 raw 里的 text + x/y，我再调阈值。", flush=True)
         return None
 
-    filtered.sort(key=lambda it: (it.get("y") or 0, it.get("x") or 0))
-
-    # 发言人分类：优先用 "我说:" / "XXX说:" 文本前缀（微信 AX 亲手写的，最准）；
-    # 前缀缺失时回退到 x 坐标分类
-    split = area_x + area_w / 2
-
-    lines: list[str] = []
-    for it in filtered:
-        text = it["text"]
-        # 1. 时间戳 → 渲染成居中分隔条
-        if _is_timestamp(text):
-            lines.append(f"  ──【{text.strip()}】──")
-            continue
-        # 2. 带发言人前缀的正常消息
-        name, body = _parse_speaker(text)
-        if name == "我":
-            lines.append(f"我：{body}")
-        elif name is not None:
-            # 对方：用「对方」统一标签，不直接暴露真实姓名
-            lines.append(f"对方：{body}")
+    # 去重：同一条消息会被 UIA 同时报为 ListItemControl（整行容器，宽度≈聊天区宽）
+    # 和 TextControl（紧贴文字的气泡框），两者 text 相同但 y 可能差 10~15 像素。
+    # 老的 "y//20 桶" 会在桶边界两侧翻车（如 y=372→18 而 y=385→19），导致同一条
+    # 被保留两份——一份被判成"对方"（宽容器的采样点全落在聊天区白底上），一份
+    # 被判成"我"（紧贴文字的采样点落在绿气泡上）。
+    # 改法：按 text 分组，组内按 y 排序，相邻两条 y 差 ≤ 30 像素视为同一条气泡
+    # 的不同控件，保留**最窄**的那个（真正的文本气泡，不是容器）。
+    raw_items.sort(key=lambda it: (it["text"], it["y"]))
+    items: list[dict] = []
+    for it in raw_items:
+        if (
+            items
+            and items[-1]["text"] == it["text"]
+            and abs(items[-1]["y"] - it["y"]) <= 30
+        ):
+            if it["w"] < items[-1]["w"]:
+                items[-1] = it
         else:
-            # 无前缀兜底：靠 x 坐标
-            x_center = (it.get("x") or 0) + (it.get("w") or 0) / 2
-            speaker = "我" if x_center >= split else "对方"
-            lines.append(f"{speaker}：{text}")
-    return "\n".join(lines), len(filtered)
+            items.append(it)
+    items.sort(key=lambda it: (it["y"], it["x"]))
+
+    # 先对整个微信窗口截一次屏，供气泡颜色采样（最可靠的发言人判定依据）
+    pixels_info = _grab_wechat_pixels((wx, wy, wx + ww, wy + wh))
+
+    chat_right = chat_x + chat_w
+    lines: list[str] = []
+    prev = None
+    for it in items:
+        text = it["text"]
+        if _is_timestamp(text):
+            ln = f"  ──【{text.strip()}】──"
+        else:
+            name, body = _parse_speaker(text)
+            if name == "我":
+                ln = f"我：{body}"
+            elif name is not None:
+                ln = f"对方：{body}"
+            else:
+                # 发言人判定（对齐 macOS accessibility.py 的兜底）：
+                #   1) 优先气泡颜色投票（文字 bbox 外侧采样，绿=我，白=对方）
+                #   2) 颜色不分胜负时：用气泡中心点相对聊天区中线判定
+                speaker, g_votes, w_votes, skip = _vote_bubble_speaker(pixels_info, it)
+                src = "color"
+                if speaker is None:
+                    split = chat_x + chat_w / 2
+                    x_center = it["x"] + it["w"] / 2
+                    speaker = "我" if x_center >= split else "对方"
+                    src = "position"
+                if debug:
+                    preview = text[:16] + ("…" if len(text) > 16 else "")
+                    print(
+                        f"[UIA] speaker={speaker} via={src} "
+                        f"green={g_votes} white={w_votes} skip={skip} "
+                        f"x={it['x']} w={it['w']} text={preview!r}",
+                        flush=True,
+                    )
+                ln = f"{speaker}：{text}"
+        if ln != prev:  # 相邻去重（防后续重复排版）
+            lines.append(ln)
+            prev = ln
+
+    total = len(lines)
+    print(f"[UIA] 读取完成，{total} 条消息", flush=True)
+    return "\n".join(lines), total
 
 
-# --- 精准滚动：只动聊天区的 AXScrollBar，不发键盘事件（避免把侧边栏一起滚了）---
+# ---------- 翻页滚动（macOS 风格：精准 ScrollPattern 控制） ----------
+#
+# 参考 accessibility.py（macOS）的做法：
+#   1. 定位聊天区的滚动容器（macOS 是 AXScrollArea，Windows 是支持 ScrollPattern 的控件）
+#   2. 结束后恢复原始滚动位置，对用户视角零打扰
+#   3. 合并用最简单的 set 去重（按完整行文本），跨 pass 的重复自然被吃掉
+#
+# 关键差异 —— 为什么 Windows 要用 SmallDecrement 而不是 SetScrollPercent：
+#   • macOS AXScrollArea 的 AXChildren 会暴露**已加载的全部行**（含屏外），_walk 一次
+#     就能抓满，就算 scroll 百分比跳跃式变化也不会漏中间消息。
+#   • Windows UIA 对 ListControl 做了 virtualization，UIA 树里**只有 viewport 可见的
+#     ListItemControl**。屏外的消息在 UIA 里不存在，必须滚到可见区域才能抓到。
+#   • 所以 Windows 必须保证相邻 pass 的 viewport **有足够重叠**，否则中间消息会
+#     被跳过。SetScrollPercent(step=25%) 在长历史聊天里一次跳 20+ 行，viewport
+#     只有 ~15 行 → 必漏。改用 Scroll(NoAmount, SmallDecrement) 每次滚一行，
+#     一 pass 滚固定行数（< 半个 viewport），重叠有保证。
 
-def _find_wechat_chat_scroll() -> dict | None:
-    """定位聊天区的 AXScrollArea 并返回它的元素信息。无法定位返回 None。"""
-    pid = wechat_pid()
-    if pid is None:
-        return None
-    app_elem = AXUIElementCreateApplication(pid)
-    if app_elem is None:
-        return None
-    win = _attr(app_elem, "AXFocusedWindow")
-    if win is None:
-        wins = _attr(app_elem, "AXWindows")
-        if wins:
-            win = wins[0]
-    if win is None:
-        return None
-    win_pos = _parse_point(_attr(win, "AXPosition"))
-    win_size = _parse_size(_attr(win, "AXSize"))
-    if not win_pos or not win_size:
-        return None
-    bounds = (win_pos[0], win_pos[1], win_size[0], win_size[1])
-    scrolls: list[dict] = []
-    _find_scroll_areas(win, scrolls)
-    return _pick_chat_scroll_area(scrolls, bounds)
+def _find_chat_scroll_container(win_ctrl) -> dict | None:
+    """在微信窗口里搜索支持 ScrollPattern 且位于聊天区的最大控件。
 
-
-def _get_chat_scroll_value(chat_scroll: dict) -> float | None:
-    """读当前聊天区 vertical scroll bar 的 AXValue（0.0 最顶，1.0 最底）。"""
-    vscroll = _attr(chat_scroll["elem"], "AXVerticalScrollBar")
-    if vscroll is None:
-        return None
-    v = _attr(vscroll, "AXValue")
+    微信的聊天列表通常是 List/Pane，对应的 UIA 控件会暴露 ScrollPattern。
+    判断标准：
+      • 支持 GetScrollPattern() 且 VerticalScrollPercent != -1（真的可滚）
+      • 中心点在窗口右半边（排除左侧联系人列表的滚动条）
+      • 尺寸够大（> 200x200，排除小部件）
+      • 同时满足多个时取面积最大的
+    """
     try:
-        return float(v) if v is not None else None
-    except (TypeError, ValueError):
+        rect = win_ctrl.BoundingRectangle
+        wx, wy = rect.left, rect.top
+        ww, wh = rect.right - wx, rect.bottom - wy
+    except Exception:  # noqa: BLE001
         return None
 
+    chat_left = wx + ww * CONTACT_FRAC
+    best: dict | None = None
+    stack: list[tuple[object, int]] = [(win_ctrl, 0)]
 
-def _set_chat_scroll_value(chat_scroll: dict, value: float) -> bool:
-    """写聊天区 vertical scroll bar 的 AXValue。成功返回 True。"""
-    vscroll = _attr(chat_scroll["elem"], "AXVerticalScrollBar")
-    if vscroll is None:
-        return False
-    value = max(0.0, min(1.0, float(value)))
+    while stack:
+        ctrl, depth = stack.pop()
+        if depth > 18:
+            continue
+        try:
+            pat = ctrl.GetScrollPattern()
+        except Exception:  # noqa: BLE001
+            pat = None
+        if pat is not None:
+            try:
+                v = pat.VerticalScrollPercent
+            except Exception:  # noqa: BLE001
+                v = -1
+            if v is not None and v >= 0:
+                try:
+                    r = ctrl.BoundingRectangle
+                    cx = (r.left + r.right) / 2
+                    w = r.right - r.left
+                    h = r.bottom - r.top
+                    if cx > chat_left and w > 200 and h > 200:
+                        area = w * h
+                        if best is None or area > best["area"]:
+                            best = {
+                                "ctrl": ctrl, "pattern": pat,
+                                "percent": float(v), "area": area,
+                            }
+                except Exception:  # noqa: BLE001
+                    pass
+        try:
+            child = ctrl.GetFirstChildControl()
+            while child:
+                stack.append((child, depth + 1))
+                try:
+                    child = child.GetNextSiblingControl()
+                except Exception:  # noqa: BLE001
+                    break
+        except Exception:  # noqa: BLE001
+            pass
+    return best
+
+
+def _send_mousewheel_to_hwnd(hwnd: int, screen_x: int, screen_y: int,
+                              clicks: int = 1, direction: int = 1) -> bool:
+    """直接向 HWND 投递 WM_MOUSEWHEEL，不移动用户光标，不依赖 UIA。
+
+    这是最接近"用户真的滚了一下鼠标滚轮"的方式。DirectUI 自绘控件（微信
+    聊天区）对 UIA ScrollPattern 静默失败，但对 WM_MOUSEWHEEL 必然响应，
+    因为微信自己就是按这个消息来处理滚动的。
+
+    direction=+1 向上（向老消息），-1 向下（向新消息）。
+    返回 True 表示调用 SendMessage 成功。
+    """
     try:
-        err = AXUIElementSetAttributeValue(vscroll, "AXValue", value)
-        # 某些绑定返回 int (0=成功)，某些直接抛异常
-        return err in (0, None)
+        import ctypes
+        user32 = ctypes.windll.user32
+        WM_MOUSEWHEEL = 0x020A
+        WHEEL_DELTA = 120
+        # wParam: HIWORD = wheel delta (signed 16-bit)
+        delta = WHEEL_DELTA * (1 if direction > 0 else -1)
+        wparam = (delta & 0xFFFF) << 16
+        # lParam: 低 16 位 x，高 16 位 y（屏幕坐标）
+        lparam = ((screen_y & 0xFFFF) << 16) | (screen_x & 0xFFFF)
+        for _ in range(max(1, clicks)):
+            user32.SendMessageW(hwnd, WM_MOUSEWHEEL, wparam, lparam)
+            time.sleep(0.05)
+        return True
     except Exception as e:  # noqa: BLE001
-        print(f"[AX] 设置 scrollbar AXValue 失败: {e}", flush=True)
+        print(f"[UIA] SendMessage WM_MOUSEWHEEL 失败: {e}", flush=True)
         return False
 
 
-def read_wechat_multi_pass(passes: int = 2, step: float = 0.3) -> tuple[str, int] | None:
+def _scroll_wheel_real(cx: int, cy: int, clicks: int = 1, direction: int = 1) -> None:
+    """真实 mouse_event 滚轮（会临时移动光标）。SendMessage 打不动时的终极兜底。"""
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        MOUSEEVENTF_WHEEL = 0x0800
+        WHEEL_DELTA = 120
+        delta = WHEEL_DELTA * (1 if direction > 0 else -1)
+        # 保存当前光标位置
+        from ctypes import wintypes
+        class POINT(ctypes.Structure):
+            _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+        saved = POINT()
+        user32.GetCursorPos(ctypes.byref(saved))
+        user32.SetCursorPos(int(cx), int(cy))
+        time.sleep(0.03)
+        for _ in range(max(1, clicks)):
+            user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta, 0)
+            time.sleep(0.06)
+        # 恢复光标
+        user32.SetCursorPos(saved.x, saved.y)
+    except Exception as e:  # noqa: BLE001
+        print(f"[UIA] mouse_event 滚轮失败: {e}", flush=True)
+
+
+def _topmost_chat_text(win_ctrl, bounds: tuple[float, float, float, float]) -> str | None:
+    """取当前 viewport 最顶 ListItemControl 的文本，用作滚动是否生效的锚点。"""
+    items: list[dict] = []
+    _walk_controls(win_ctrl, items, bounds_filter=bounds, max_depth=15, cap=300)
+    list_items = [it for it in items if it["role"] == "ListItemControl"]
+    if not list_items:
+        return None
+    top = min(list_items, key=lambda it: it["y"])
+    return top["text"]
+
+
+# UIA ScrollAmount 常量（uiautomation 包不总是暴露 enum，直接用数值）
+_SCROLL_LARGE_DECREMENT = 0
+_SCROLL_SMALL_DECREMENT = 1
+_SCROLL_NO_AMOUNT = 2
+_SCROLL_LARGE_INCREMENT = 3
+_SCROLL_SMALL_INCREMENT = 4
+
+
+def _scroll_up_small(pattern, steps: int) -> bool:
+    """用 ScrollPattern.Scroll(SmallDecrement) 向上滚 steps 行。
+
+    每次 SmallDecrement ≈ 滚一行消息。调用 N 次 = 向上 N 行。
+    配合 viewport ~15 行，每 pass 滚 8 行 ⇒ 相邻 pass 的 viewport 有 ~7 行重叠
+    ⇒ 绝不跳过中间消息。成功返回 True，不支持返回 False 让上层走 SetScrollPercent。
+    """
+    try:
+        for _ in range(max(1, steps)):
+            pattern.Scroll(_SCROLL_NO_AMOUNT, _SCROLL_SMALL_DECREMENT)
+            time.sleep(0.02)
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"[UIA] SmallDecrement 不支持 ({e})", flush=True)
+        return False
+
+
+def read_wechat_multi_pass(passes: int = 8, clicks_per_pass: int = 1) -> tuple[str, int] | None:
     """读取微信并自动向上滚动 N 次收集更多历史。
 
-    **精准滚动，只动聊天区**：通过 AXUIElementSetAttributeValue 直接写聊天区
-    `AXVerticalScrollBar` 的 `AXValue`（0 最顶 / 1 最底），**完全不碰键盘、不激活微信、
-    不影响左侧联系人列表**。读取结束后精确恢复原始滚动位置。
+    **关键：不依赖 UIA ScrollPattern** —— 上一版日志显示那个容器在微信 DirectUI
+    上定位错误（原位置 1.0% 却在聊天底部；一次 SmallDecrement 就跳到 0%），所以
+    百分比语义完全不可靠。改为直接给微信主 HWND 发 WM_MOUSEWHEEL，等效于用户
+    手动滚一下鼠标滚轮，微信必然按消息条数滚动，中间消息一条都不漏。
 
-    失败（AX 不支持写 AXValue 等）会退回只读当前视图。
+    策略：
+      1. 读首屏；定位微信主 HWND 和聊天区中心屏幕坐标；
+      2. 循环 passes 次：SendMessage(WM_MOUSEWHEEL, +DELTA) × clicks_per_pass,
+         每 click ≈ 3 行消息，等 0.6s 让懒加载渲染完成，再读一次；
+      3. **锚点验证** —— 记每 pass 开始时最顶 ListItem 的文本，滚完对比：
+         • 文本变了 → 滚动成功；
+         • 文本没变 → SendMessage 被吃了，改 mouse_event 真实滚轮（临时动光标再恢复）；
+         • 还不动 = 判定触顶，break。
+      4. 结束后反向滚回去，恢复用户视角；
+      5. 合并：reversed + set 去重（macOS 同款）。
     """
     first = read_wechat_as_text()
     if first is None or passes <= 0:
         return first
 
-    chat_scroll = _find_wechat_chat_scroll()
-    if chat_scroll is None:
-        print("[AX] 没定位到聊天滚动区，跳过多轮", flush=True)
+    win_ctrl = _get_wechat_control()
+    hwnd = _find_wechat_hwnd()
+    if win_ctrl is None or not hwnd:
+        print("[UIA] 无法定位微信 HWND，返回首屏", flush=True)
         return first
 
-    original = _get_chat_scroll_value(chat_scroll)
-    if original is None:
-        print("[AX] 拿不到 scrollbar 当前值（可能是 WeChat 不暴露 AXValue），跳过多轮", flush=True)
+    try:
+        r = win_ctrl.BoundingRectangle
+        wx, wy = r.left, r.top
+        ww, wh = r.right - wx, r.bottom - wy
+    except Exception:  # noqa: BLE001
         return first
-    print(f"[AX] 聊天区 scrollbar 原位置 = {original:.3f}", flush=True)
+
+    chat_bounds = (
+        wx + ww * CONTACT_FRAC,
+        wy + wh * TOOLBAR_FRAC,
+        ww * (1.0 - CONTACT_FRAC),
+        wh * (1.0 - TOOLBAR_FRAC - INPUT_FRAC),
+    )
+    chat_cx = int(chat_bounds[0] + chat_bounds[2] / 2)
+    chat_cy = int(chat_bounds[1] + chat_bounds[3] / 2)
 
     outputs: list[list[str]] = [first[0].splitlines()]
+    print(f"[UIA] 多轮读取：每 pass 滚 {clicks_per_pass} 刻度，"
+          f"中心=({chat_cx},{chat_cy}) HWND={hwnd}", flush=True)
+
+    stuck_count = 0
+    total_clicks_up = 0
+    prev_anchor = _topmost_chat_text(win_ctrl, chat_bounds)
+
     try:
-        current = original
         for i in range(1, passes + 1):
-            # 向上滚动 step 个单位（一次大约看到几屏历史；微信会懒加载更老的）
-            target = max(0.0, current - step)
-            if not _set_chat_scroll_value(chat_scroll, target):
-                print(f"[AX] pass {i}: AX 写 scrollbar 失败，停止", flush=True)
-                break
-            current = target
-            # 给微信时间触发懒加载 + 渲染
-            time.sleep(0.7)
-            r = read_wechat_as_text()
+            # 第 1 层：WM_MOUSEWHEEL via SendMessage（不动用户光标）
+            _send_mousewheel_to_hwnd(hwnd, chat_cx, chat_cy,
+                                     clicks=clicks_per_pass, direction=1)
+            total_clicks_up += clicks_per_pass
+            time.sleep(0.6)
+
+            new_anchor = _topmost_chat_text(win_ctrl, chat_bounds)
+
+            if new_anchor is not None and new_anchor == prev_anchor:
+                # 第 2 层：mouse_event 真实滚轮
+                print(f"[UIA] pass {i}: SendMessage 未生效，改用 mouse_event",
+                      flush=True)
+                _scroll_wheel_real(chat_cx, chat_cy,
+                                   clicks=max(2, clicks_per_pass), direction=1)
+                total_clicks_up += max(2, clicks_per_pass)
+                time.sleep(0.6)
+                new_anchor = _topmost_chat_text(win_ctrl, chat_bounds)
+                if new_anchor == prev_anchor:
+                    stuck_count += 1
+                    if stuck_count >= 2:
+                        print("[UIA] 连续 2 pass 滚不动，判定已触顶", flush=True)
+                        break
+                    continue
+
+            stuck_count = 0
+            prev_anchor = new_anchor
+
+            r = read_wechat_as_text(debug=False)
             if r is None:
-                print(f"[AX] pass {i}: 读取失败", flush=True)
+                print(f"[UIA] pass {i}: 读取失败，跳过", flush=True)
                 continue
             lines = r[0].splitlines()
-            print(
-                f"[AX] pass {i}: scroll→{target:.3f}，读到 {len(lines)} 行",
-                flush=True,
-            )
+            anchor_preview = (new_anchor[:16] if new_anchor else "?")
+            print(f"[UIA] pass {i}: 读到 {len(lines)} 行 (顶部={anchor_preview!r})",
+                  flush=True)
             outputs.append(lines)
-            if current <= 0.001:
-                print("[AX] 已触顶，停止", flush=True)
-                break
     finally:
-        # 恢复用户原本的滚动位置，视角零打扰
-        _set_chat_scroll_value(chat_scroll, original)
+        if total_clicks_up > 0:
+            print(f"[UIA] 恢复视角：向下滚 {total_clicks_up + 1} 刻度", flush=True)
+            _send_mousewheel_to_hwnd(hwnd, chat_cx, chat_cy,
+                                     clicks=total_clicks_up + 1, direction=-1)
 
-    # 合并：最后一次 pass（对应最老的消息）放最上面；按文本去重
+    # 合并：参考 macOS 版本，reversed 顺序 + set 去重
     seen: set[str] = set()
     merged: list[str] = []
     for pass_lines in reversed(outputs):
@@ -563,6 +728,8 @@ def read_wechat_multi_pass(passes: int = 2, step: float = 0.3) -> tuple[str, int
             if line and line not in seen:
                 seen.add(line)
                 merged.append(line)
+
     total = len(merged)
-    print(f"[AX] 多轮合并后总计 {total} 条", flush=True)
+    total_raw = sum(len(p) for p in outputs)
+    print(f"[UIA] 多轮合并后共 {total} 条（去重前 {total_raw}）", flush=True)
     return "\n".join(merged), total

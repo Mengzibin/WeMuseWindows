@@ -10,21 +10,48 @@ from typing import Callable
 
 
 def _find_claude_cli() -> str:
-    """优先 PATH 中的 claude；否则回落到 VSCode 扩展内置二进制。"""
-    path_claude = shutil.which("claude")
+    """优先 PATH 中的 claude；否则按平台回落到 VSCode 扩展内置二进制。"""
+    import sys
+
+    # 1. PATH 中直接有 claude / claude.exe
+    path_claude = shutil.which("claude") or shutil.which("claude.exe")
     if path_claude:
         return path_claude
 
-    # VSCode 扩展内置 claude（版本号会变，取最新）
-    pattern = os.path.expanduser(
-        "~/.vscode/extensions/anthropic.claude-code-*-darwin-arm64/resources/native-binary/claude"
-    )
-    candidates = sorted(glob.glob(pattern))
-    if candidates:
-        return candidates[-1]
+    # 2. 平台特定的 VSCode 扩展路径（版本号通配，取最新）
+    if sys.platform == "win32":
+        patterns = [
+            os.path.expanduser(
+                r"~\.vscode\extensions\anthropic.claude-code-*-win32-x64\resources\native-binary\claude.exe"
+            ),
+            os.path.expanduser(
+                r"~\.vscode\extensions\anthropic.claude-code-*-win32-arm64\resources\native-binary\claude.exe"
+            ),
+            # Claude 桌面应用（Windows 安装程序）
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\Claude\claude.exe"),
+            os.path.expandvars(r"%APPDATA%\Claude\claude.exe"),
+        ]
+    else:
+        # macOS（arm64 / x64）
+        patterns = [
+            os.path.expanduser(
+                "~/.vscode/extensions/anthropic.claude-code-*-darwin-arm64/resources/native-binary/claude"
+            ),
+            os.path.expanduser(
+                "~/.vscode/extensions/anthropic.claude-code-*-darwin-x64/resources/native-binary/claude"
+            ),
+        ]
+
+    for pattern in patterns:
+        candidates = sorted(glob.glob(pattern))
+        if candidates:
+            return candidates[-1]
 
     raise RuntimeError(
-        "未找到 claude CLI。请确认 Claude Code 已安装（VSCode 扩展或 `npm i -g @anthropic-ai/claude-code`）。"
+        "未找到 claude CLI。\n"
+        "请确认 Claude Code 已安装：\n"
+        "  • VSCode 扩展（推荐）：在 VSCode 扩展市场搜索 'Claude Code'\n"
+        "  • 或 npm 全局安装：npm install -g @anthropic-ai/claude-code"
     )
 
 
@@ -49,6 +76,8 @@ def generate_reply(prompt: str, timeout: int = 60) -> str:
         [CLAUDE_BIN, "-p", "--output-format", "text", prompt],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=timeout,
         env=_build_env(),
     )
@@ -83,6 +112,8 @@ def generate_reply_stream(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         bufsize=1,  # 行缓冲
         env=_build_env(),
     )

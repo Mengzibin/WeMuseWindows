@@ -1,7 +1,21 @@
-ocrmac>=1.0.0
 pyperclip>=1.8.2
 pynput>=1.7.6
 Pillow>=10.0.0
-pyobjc-core>=10.0
-pyobjc-framework-Cocoa>=10.0
-pyobjc-framework-ApplicationServices>=10.0
+uiautomation>=2.0.18
+pywin32>=306
+pystray>=0.19.5
+keyboard>=0.13.5
+mss>=9.0.1
+pytesseract>=0.3.10
+wcferry>=39.5.2
+winrt-runtime>=3.2.1
+winrt-Windows.Foundation>=3.2.1
+winrt-Windows.Foundation.Collections>=3.2.1
+winrt-Windows.Media.Ocr>=3.2.1
+winrt-Windows.Globalization>=3.2.1
+winrt-Windows.Graphics.Imaging>=3.2.1
+winrt-Windows.Storage.Streams>=3.2.1
+# PaddleOCR：ML 中文 OCR（CPU，带 bbox，用于发言人识别，对齐 macOS Apple Vision）
+# paddlepaddle 无 -gpu 后缀即 CPU 版；首次调用下载模型到 ~/.paddleocr (~100MB)
+paddleocr>=2.7.0
+paddlepaddle>=2.6.0

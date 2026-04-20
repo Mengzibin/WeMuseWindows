@@ -1,28 +1,27 @@
-"""macOS 全局热键：用 Cocoa NSEvent 主线程监听器实现。
+"""Windows 全局热键：使用 keyboard 库实现，对应 macOS 版的 hotkey.py。
 
-之前用 pynput.keyboard.GlobalHotKeys，它的监听器在子线程调 TSM API，
-macOS 26+ 的主线程断言会直接 SIGTRAP 杀进程。
-改用 NSEvent.addGlobalMonitorForEventsMatchingMask 让回调在主线程触发，避开问题。
+热键映射（macOS → Windows）：
+  ⌘⇧R  →  Ctrl+Shift+R  显示/隐藏窗口
+  ⌘⇧G  →  Ctrl+Shift+G  截图 OCR
+  ⌘⇧A  →  Ctrl+Shift+A  Accessibility 读取 + 生成
 
-注意：NSEvent 全局监听仍需要"辅助功能"权限（和 pynput 一样）。
+keyboard 库在 Windows 上无需管理员权限即可注册全局热键。
 """
 from __future__ import annotations
 
-try:
-    from Cocoa import (
-        NSEvent,
-        NSEventMaskKeyDown,
-        NSEventModifierFlagCommand,
-        NSEventModifierFlagControl,
-        NSEventModifierFlagOption,
-        NSEventModifierFlagShift,
-    )
+from typing import Callable
 
+try:
+    import keyboard as _kb
     _AVAIL = True
     _ERR = ""
 except Exception as e:  # noqa: BLE001
     _AVAIL = False
     _ERR = str(e)
+    _kb = None  # type: ignore[assignment]
+
+# 已注册的热键列表，保存下来以便 unregister_all 清理
+_registered: list[str] = []
 
 
 def available() -> bool:
@@ -35,55 +34,51 @@ def import_error() -> str:
 
 def register(
     key_char: str,
-    callback,
-    cmd: bool = True,
+    callback: Callable[[], None],
+    ctrl: bool = True,
     shift: bool = True,
-    ctrl: bool = False,
-    opt: bool = False,
-):
+    alt: bool = False,
+    win: bool = False,
+) -> str | None:
     """注册一个全局热键。
 
-    key_char: 单个字符，如 'a' / 'g' / 'r'
-    callback: 无参回调。会在主线程被调用。
+    key_char: 单个字母，如 'r' / 'g' / 'a'
+    ctrl/shift/alt/win: 修饰键开关
 
-    返回 monitor 对象 —— 调用方必须保存住这个引用，否则会被 GC 掉热键就没了。
+    返回热键字符串（如 'ctrl+shift+r'），可用于后续取消注册。
     不可用时返回 None。
     """
     if not _AVAIL:
         return None
 
-    req = 0
-    if cmd:
-        req |= NSEventModifierFlagCommand
-    if shift:
-        req |= NSEventModifierFlagShift
+    parts: list[str] = []
     if ctrl:
-        req |= NSEventModifierFlagControl
-    if opt:
-        req |= NSEventModifierFlagOption
+        parts.append("ctrl")
+    if shift:
+        parts.append("shift")
+    if alt:
+        parts.append("alt")
+    if win:
+        parts.append("windows")
+    parts.append(key_char.lower())
+    combo = "+".join(parts)
 
-    mask_of_interest = (
-        NSEventModifierFlagCommand
-        | NSEventModifierFlagShift
-        | NSEventModifierFlagControl
-        | NSEventModifierFlagOption
-    )
+    try:
+        _kb.add_hotkey(combo, callback, suppress=False)
+        _registered.append(combo)
+        return combo
+    except Exception as e:  # noqa: BLE001
+        print(f"[hotkey] 注册 {combo!r} 失败：{e}", flush=True)
+        return None
 
-    key_lower = key_char.lower()
 
-    def _handler(event):
+def unregister_all() -> None:
+    """取消注册所有已注册的热键（程序退出前调用）。"""
+    if not _AVAIL:
+        return
+    for combo in _registered:
         try:
-            mods = int(event.modifierFlags()) & mask_of_interest
-            if mods != req:
-                return
-            chars = event.charactersIgnoringModifiers() or ""
-            if chars.lower() == key_lower:
-                callback()
-        except Exception as e:  # noqa: BLE001
-            # handler 内异常不能抛出到 AppKit，否则可能搞坏 runloop
-            print(f"[hotkey] handler 异常：{e}")
-
-    monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
-        NSEventMaskKeyDown, _handler
-    )
-    return monitor
+            _kb.remove_hotkey(combo)
+        except Exception:  # noqa: BLE001
+            pass
+    _registered.clear()

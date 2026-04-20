@@ -33,15 +33,69 @@ def extract_my_examples(chat_text: str, limit: int = 10) -> list[str]:
     return out[-limit:]
 
 
+def opponent_length_since_my_last(chat_text: str) -> int:
+    """统计"上一轮我发言之后，对方一共发了多少字"。
+
+    用于让助手生成的回复长度跟对方的发言总量对齐——比如对方连发 3 条 40 字的
+    消息，对方总长 120 字，就让我的回复也在这个量级。
+
+    规则：
+    - 从聊天尾部倒着扫，碰到「我：」就停
+    - 中间所有「对方：」行的正文（去掉前缀、去掉时间戳行）累加字数
+    - 全都是"对方：..."（没见过「我：」）也照样全累加
+    - 没有任何「对方：」返回 0
+    """
+    lines = chat_text.splitlines()
+    total = 0
+    for line in reversed(lines):
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith("我：") or s.startswith("我:"):
+            break
+        if s.startswith("──【") or s.startswith("──["):
+            continue  # 时间分隔条，跳过
+        if s.startswith("对方：") or s.startswith("对方:"):
+            msg = s.split("：", 1)[-1].split(":", 1)[-1].strip()
+            total += len(msg)
+    return total
+
+
+# 多条回复用这个分隔符串起来输出；选它是因为聊天里几乎不可能出现裸的 <MSG>
+MSG_DELIMITER = "<MSG>"
+
+
+def split_replies(reply: str) -> list[str]:
+    """把 LLM 输出按 <MSG> 拆成多条消息，过滤空串。
+
+    如果模型没按规则吐分隔符（只给一整段），就按段落（空行）做次选切分；
+    还是拆不出就整段作为单条返回。
+    """
+    reply = (reply or "").strip()
+    if not reply:
+        return []
+    if MSG_DELIMITER in reply:
+        parts = [p.strip() for p in reply.split(MSG_DELIMITER)]
+    else:
+        # 次选：按空行切（段落分隔）
+        parts = [p.strip() for p in reply.split("\n\n")]
+    parts = [p for p in parts if p]
+    return parts or [reply]
+
+
 def build_prompt(
     chat_text: str,
     style: str,
     extra_instruction: str = "",
     mimic_user: bool = False,
+    target_length: int = 0,
+    reply_count: int = 1,
 ) -> str:
     """拼接最终送给 Claude 的 prompt。
 
     mimic_user=True 时，会把聊天里「我：…」的历史作为 few-shot 塞进去，让生成尽量贴近用户本人的说话习惯。
+    target_length>0 时，覆盖默认的"匹配最后一条"规则，直接要求总长接近该值。
+    reply_count>1 时，要求产出 N 条独立消息，用 <MSG> 分隔。
     """
     style_desc = STYLES.get(style, style)
     extra = f"\n额外要求：{extra_instruction}" if extra_instruction.strip() else ""
@@ -56,6 +110,43 @@ def build_prompt(
                 "让生成的回复在满足风格要求的前提下，尽量贴近【我】本人的说话方式：\n"
                 f"{bullets}\n"
             )
+
+    # 规则 2：长度——目标长度优先，否则走默认的"对齐最后一条"逻辑
+    reply_count = max(1, int(reply_count or 1))
+    if target_length and target_length > 0:
+        if reply_count > 1:
+            per = max(3, target_length // reply_count)
+            length_rule = (
+                f"2. 总回复长度约 {target_length} 字（允许 ±25%），分成 {reply_count} 条消息，"
+                f"**每条约 {per} 字**。别把一条长话硬切成几段，每条要能独立成立。"
+            )
+        else:
+            length_rule = (
+                f"2. 回复长度控制在 {target_length} 字左右（允许 ±25%）。"
+                f"这是根据上轮我发言后对方累计字数算出来的，用来和对方"
+                f"的表达量对齐——别显得敷衍，也别冗长。"
+            )
+    else:
+        if reply_count > 1:
+            length_rule = (
+                f"2. 生成 {reply_count} 条独立消息，每条长度与对话里最后一条大致匹配，"
+                f"**不要**把一条长消息切成几段。"
+            )
+        else:
+            length_rule = (
+                "2. 长度要和\"对话里最后一条消息\"的长度**大致匹配**——对方 5 字别回 50 字，"
+                "我刚发了一长段别只续两个字。允许 ±30% 浮动。"
+            )
+
+    # 多条消息的输出格式规则
+    multi_rule = ""
+    if reply_count > 1:
+        multi_rule = (
+            f"\n6. 输出 {reply_count} 条消息时，**每两条之间用一个 `{MSG_DELIMITER}` 分隔**，"
+            f"前后不加空行也不加别的标点。示例（3 条）：\n"
+            f"   第一句{MSG_DELIMITER}第二句{MSG_DELIMITER}第三句\n"
+            f"   每条消息都要自成一句话，不要彼此重复或简单续写。"
+        )
 
     return f"""你是用户的微信聊天助手。下面是用户当前聊天窗口里识别到的对话内容，按时间从上到下排列。
 每行格式约定：
@@ -76,8 +167,8 @@ def build_prompt(
 
 硬性规则：
 1. 只输出消息正文本身，不要加「回复：」「我：」之类的前缀，不要加引号，不要解释。
-2. 长度要和"对话里最后一条消息"的长度**大致匹配**——对方 5 字别回 50 字，我刚发了一长段别只续两个字。允许 ±30% 浮动。
+{length_rule}
 3. 符合中文微信聊天习惯：偏口语，除非必要不分段、不列要点。
 4. 续接时，新消息要承接上一句的语气和话题，有新增信息或推进，不要单纯重复。
-5. 不要编造用户没说过的事实（时间、地点、承诺、人名等）。
+5. 不要编造用户没说过的事实（时间、地点、承诺、人名等）。{multi_rule}
 """
